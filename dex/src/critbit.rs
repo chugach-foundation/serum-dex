@@ -252,13 +252,13 @@ const_assert_eq!(_NODE_ALIGN, align_of::<AnyNode>());
 
 #[derive(Copy, Clone)]
 #[repr(packed)]
-struct SlabHeader {
+pub struct SlabHeader {
     bump_index: u64,
     free_list_len: u64,
     free_list_head: u32,
 
     root_node: u32,
-    leaf_count: u64,
+    pub leaf_count: u64,
 }
 unsafe impl Zeroable for SlabHeader {}
 unsafe impl Pod for SlabHeader {}
@@ -347,7 +347,7 @@ impl Slab {
         (header, nodes)
     }
 
-    fn header(&self) -> &SlabHeader {
+    pub fn header(&self) -> &SlabHeader {
         self.parts().0
     }
 
@@ -491,7 +491,83 @@ pub enum SlabTreeError {
     OutOfSpace,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct OrderBookOrder {
+    pub price: u64,
+    pub quantity: u64,
+    pub order_id: u128,
+    pub client_order_id: u64,
+}
+
 impl Slab {
+    // Each one of these does a preorder traversal
+    pub fn get_depth(
+        &self,
+        depth: u64,
+        pc_lot_size: u64,
+        coin_lot_size: u64,
+        is_asks: bool,
+    ) -> Vec<OrderBookOrder> {
+        let (header, _nodes) = self.parts();
+        let depth_to_get: usize = std::cmp::min(depth, header.leaf_count) as usize;
+        let mut res: Vec<OrderBookOrder> = Vec::with_capacity(depth_to_get);
+        let maybe_leafs = self.get_leaf_depth(depth_to_get, is_asks);
+
+        let leafs = match maybe_leafs {
+            Some(l) => l,
+            _ => {
+                return res;
+            }
+        };
+        for leaf in leafs {
+            let leaf_price = u64::from(leaf.price());
+            let token_price =
+                u128::from(leaf_price) * u128::from(pc_lot_size) / u128::from(coin_lot_size);
+            let token_quantity = leaf.quantity() * coin_lot_size;
+            let line = OrderBookOrder {
+                price: u64::try_from(token_price).unwrap(),
+                quantity: token_quantity,
+                order_id: leaf.order_id(),
+                client_order_id: leaf.client_order_id,
+            };
+            res.push(line);
+        }
+
+        res
+    }
+
+    fn get_leaf_depth(&self, depth: usize, asc: bool) -> Option<Vec<&LeafNode>> {
+        let root: NodeHandle = self.root()?;
+        let mut stack: Vec<NodeHandle> = Vec::with_capacity(self.header().leaf_count as usize);
+        let mut res: Vec<&LeafNode> = Vec::with_capacity(depth);
+        stack.push(root);
+        loop {
+            if stack.is_empty() {
+                break;
+            }
+            let node_contents = self.get(stack.pop().unwrap()).unwrap();
+            match node_contents.case().unwrap() {
+                NodeRef::Inner(&InnerNode { children, .. }) => {
+                    if asc {
+                        stack.push(children[1]);
+                        stack.push(children[0]);
+                    } else {
+                        stack.push(children[0]);
+                        stack.push(children[1]);
+                    }
+                    continue;
+                }
+                NodeRef::Leaf(leaf) => {
+                    res.push(leaf);
+                }
+            }
+            if res.len() == depth {
+                break;
+            }
+        }
+        Some(res)
+    }
+
     fn root(&self) -> Option<NodeHandle> {
         if self.header().leaf_count == 0 {
             return None;
